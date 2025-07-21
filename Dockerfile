@@ -1,24 +1,22 @@
-# Use a lightweight Python base image
+# Dockerfile
 FROM python:3.10-slim-bookworm
 
-# Set the working directory in the container
 WORKDIR /app
 
-# Copy the requirements file and install dependencies
+# Copy the requirements file into the container and install dependencies.
 COPY requirements.txt .
 
 # Install Python dependencies
 # Use --no-cache-dir to avoid storing cache in the image
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the FastAPI application code
-COPY . .
+# Copy your application code and data into the container
+COPY main.py .
+COPY data/ ./data/
 
-# Expose the port FastAPI will run on
+# Expose the port that FastAPI will run on
 EXPOSE 8000
 
-# Command to run the FastAPI application using uvicorn
-# --host 0.0.0.0 makes it accessible from outside the container
-# --port 8000 is the port inside the container
-# rag_app:app refers to the 'app' object in 'rag_app.py'
+# Command to run the FastAPI application using Uvicorn
+# For production, you would typically remove --reload
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

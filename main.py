@@ -1,200 +1,146 @@
+# main.py
 import os
-from pathlib import Path
-from typing import List, Dict, Any
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from typing import Optional, List
 
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredMarkdownLoader, TextLoader
+from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings, OllamaEmbeddings
+from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain_community.llms import Ollama
+from langchain_community.llms import HuggingFaceEndpoint
 from langchain.chains import RetrievalQA
 
-import uvicorn # Added for running the FastAPI app
-
-# --- Configuration (read from environment variables) ---
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "phi3:mini")
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "nomic-embed-text")
-DATA_DIR = "/app/data"
-CHROMA_DB_DIR = "/app/chroma_db"
-
-# FastAPI application instance
+# --- FastAPI App Initialization ---
 app = FastAPI(
-    title="RAG Docker App",
-    description="Retrieval-Augmented Generation (RAG) service with Ollama and mixed data sources.",
+    title="LangChain RAG with Hugging Face Inference API",
+    description="A FastAPI application demonstrating RAG using LangChain, Hugging Face LLM, and Hugging Face Embeddings.",
     version="1.0.0"
 )
 
-# Global variable to hold the RAG chain
+# --- Global variables for RAG components ---
+# These will be initialized once on startup
 qa_chain = None
+embeddings_model = None
+llm_model = None
+vectorstore_instance = None
 
-# Pydantic model for the query request body
+# --- Configuration (from Environment Variables) ---
+HF_TOKEN = os.getenv("HF_TOKEN")
+# Ensure HF_TOKEN is set. In a real app, you might want more robust error handling
+# or a startup check. For now, we'll raise an error if not found.
+if not HF_TOKEN:
+    raise ValueError("HF_TOKEN environment variable not set. Please set it before running the application.")
+
+# Hugging Face model IDs
+EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+LLM_MODEL_ID = "HuggingFaceH4/zephyr-7b-beta" # Or 'mistralai/Mistral-7B-Instruct-v0.2' etc.
+
+# --- Pydantic Models for API Request/Response ---
 class QueryRequest(BaseModel):
     query: str
+    max_new_tokens: Optional[int] = 500
+    temperature: Optional[float] = 0.7
 
-# Pydantic model for the response
-class RAGResponse(BaseModel):
+class SourceDocument(BaseModel):
+    page_content: str
+    metadata: dict
+
+class QueryResponse(BaseModel):
     answer: str
-    sources: List[Dict[str, Any]]
+    source_documents: List[SourceDocument]
 
-# --- Helper function to load documents ---
-def load_documents_from_dir(directory: str):
-    documents = []
-    data_path = Path(directory)
-
-    if not data_path.exists():
-        print(f"Warning: Data directory {data_path} does not exist. No documents will be loaded.")
-        return []
-
-    print(f"Loading documents from {data_path}...")
-    for file_path in data_path.iterdir():
-        try:
-            if file_path.suffix.lower() == ".pdf":
-                loader = PyPDFLoader(str(file_path))
-                documents.extend(loader.load())
-                print(f"  Loaded PDF: {file_path.name}")
-            elif file_path.suffix.lower() in [".md", ".markdown"]:
-                loader = UnstructuredMarkdownLoader(str(file_path))
-                documents.extend(loader.load())
-                print(f"  Loaded Markdown: {file_path.name}")
-            elif file_path.suffix.lower() == ".txt":
-                loader = TextLoader(str(file_path))
-                documents.extend(loader.load())
-                print(f"  Loaded Text: {file_path.name}")
-            else:
-                print(f"  Skipping unsupported file type: {file_path.name}")
-        except Exception as e:
-            print(f"  Error loading {file_path.name}: {e}")
-    return documents
-
-# --- RAG system setup function ---
-async def setup_rag_system():
-    global qa_chain # Declare global to modify the global variable
-
-    print("Starting RAG system setup...")
-    # 1. Load Documents
-    all_docs = load_documents_from_dir(DATA_DIR)
-
-    if not all_docs:
-        print("No documents loaded. Please place your data files in the 'data/' directory.")
-        # We won't exit, but the RAG chain will be None or handle empty docs
-        # If you want to force exit, raise an exception here
-        # raise RuntimeError("No documents found to build RAG system.")
-
-    # 2. Split Documents into Chunks
-    print("Splitting documents into chunks...")
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        separators=["\n\n", "\n", " ", ""]
-    )
-    chunks = text_splitter.split_documents(all_docs)
-    print(f"Loaded {len(all_docs)} documents and split into {len(chunks)} chunks.")
-
-    # 3. Initialize Embedding Model
-    print(f"Initializing embedding model: {EMBEDDING_MODEL_NAME}...")
-    embeddings = None
-    try:
-        if "ollama" in EMBEDDING_MODEL_NAME.lower() or "nomic" in EMBEDDING_MODEL_NAME.lower():
-            embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL_NAME, base_url=OLLAMA_HOST)
-            _ = embeddings.embed_query("test embedding") # Test if Ollama embedding works
-        else:
-            embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-            _ = embeddings.embed_query("test embedding") # Test if HuggingFace embedding works
-        print("Embedding model initialized successfully.")
-    except Exception as e:
-        print(f"Error initializing embedding model {EMBEDDING_MODEL_NAME}: {e}")
-        print("Please ensure the embedding model is available (e.g., pulled via Ollama or downloaded for HuggingFace).")
-        # If embedding model fails, we cannot proceed with RAG
-        raise HTTPException(status_code=500, detail=f"Failed to initialize embedding model: {e}")
-
-    # 4. Vector Database Storage (ChromaDB)
-    print("Setting up vector store...")
-    if Path(CHROMA_DB_DIR).exists() and any(Path(CHROMA_DB_DIR).iterdir()):
-        print("Loading existing vector store...")
-        vectorstore = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings)
-    else:
-        print("Creating new vector store (this might take a while for large datasets)...")
-        vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory=CHROMA_DB_DIR
-        )
-        vectorstore.persist()
-        print("Vector store created and persisted.")
-
-    # 5. Initialize Ollama LLM
-    print(f"Initializing Ollama LLM: {OLLAMA_MODEL_NAME} from {OLLAMA_HOST}...")
-    try:
-        llm = Ollama(model=OLLAMA_MODEL_NAME, base_url=OLLAMA_HOST)
-        _ = llm.invoke("Hi") # Test if LLM responds
-        print("Ollama LLM initialized successfully.")
-    except Exception as e:
-        print(f"Error initializing Ollama LLM {OLLAMA_MODEL_NAME}: {e}")
-        print("Please ensure the LLM is pulled via Ollama and Ollama container is running.")
-        # If LLM fails, we cannot proceed with RAG
-        raise HTTPException(status_code=500, detail=f"Failed to initialize LLM: {e}")
-
-    # 6. Create RAG Chain
-    retriever = vectorstore.as_retriever()
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        return_source_documents=True
-    )
-    print("RAG system setup complete.")
-
-# --- FastAPI Event Handlers ---
+# --- RAG Initialization Function ---
 @app.on_event("startup")
 async def startup_event():
-    print("FastAPI startup event triggered.")
-    await setup_rag_system()
-    print("FastAPI application ready to serve requests.")
-
-# --- FastAPI Endpoints ---
-@app.get("/")
-async def read_root():
     """
-    Health check endpoint.
+    Initialize RAG components on application startup.
+    This ensures models and vector stores are loaded once.
     """
-    return {"message": "RAG Docker App is running!"}
+    global qa_chain, embeddings_model, llm_model, vectorstore_instance
 
-@app.post("/query", response_model=RAGResponse)
+    print("Initializing Hugging Face Embeddings model...")
+    embeddings_model = HuggingFaceInferenceAPIEmbeddings(
+        api_key=HF_TOKEN,
+        model_name=EMBEDDING_MODEL_ID
+    )
+    print(f"Embedding model '{EMBEDDING_MODEL_ID}' loaded.")
+
+    print("Initializing Hugging Face LLM model...")
+    llm_model = HuggingFaceEndpoint(
+        repo_id=LLM_MODEL_ID,
+        temperature=0.7,
+        max_new_tokens=500,
+        huggingfacehub_api_token=HF_TOKEN
+    )
+    print(f"LLM model '{LLM_MODEL_ID}' loaded.")
+
+    print("Loading documents...")
+    try:
+        loader = TextLoader("./data/state_of_the_union.txt")
+        documents = loader.load()
+    except Exception as e:
+        print(f"Error loading documents: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load knowledge base documents.")
+
+    print("Splitting documents into chunks...")
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = text_splitter.split_documents(documents)
+    print(f"Created {len(chunks)} chunks.")
+
+    print("Creating vector store (this may take a moment as embeddings are generated)...")
+    try:
+        vectorstore_instance = Chroma.from_documents(
+            documents=chunks,
+            embedding=embeddings_model,
+            collection_name="state-of-the-union-rag"
+        )
+        print("Vector store created.")
+    except Exception as e:
+        print(f"Error creating vector store: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create vector store with embeddings.")
+
+    print("Setting up RetrievalQA chain...")
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm_model,
+        chain_type="stuff",
+        retriever=vectorstore_instance.as_retriever(),
+        return_source_documents=True
+    )
+    print("RAG chain initialized successfully!")
+
+# --- API Endpoint ---
+@app.post("/query", response_model=QueryResponse)
 async def query_rag(request: QueryRequest):
     """
-    Endpoint to query the RAG application.
+    Process a user query using the RAG system and return the answer along with source documents.
     """
-    global qa_chain
     if qa_chain is None:
-        raise HTTPException(status_code=503, detail="RAG system not initialized. Please wait or check logs.")
+        raise HTTPException(status_code=503, detail="RAG system not yet initialized. Please wait a moment.")
 
     print(f"Received query: {request.query}")
     try:
-        result = qa_chain.invoke({"query": request.query})
-        
-        # Format source documents for the response model
-        formatted_sources = []
-        if result.get("source_documents"):
-            for doc in result["source_documents"]:
-                formatted_sources.append({
-                    "page_content": doc.page_content,
-                    "metadata": doc.metadata
-                })
+        # Dynamically set LLM parameters if provided in the request
+        # Note: This requires re-initializing the LLM or updating its parameters,
+        # which can be complex for HuggingFaceEndpoint. For simplicity,
+        # we'll use the pre-initialized LLM's parameters.
+        # If you need dynamic LLM parameters per request, you might need to
+        # create a new HuggingFaceEndpoint instance inside this function,
+        # which could impact performance.
+        # For this example, we'll stick to the startup-configured LLM.
 
-        return RAGResponse(
-            answer=result["result"],
-            sources=formatted_sources
-        )
+        response = qa_chain.invoke({"query": request.query})
+
+        source_docs = [
+            SourceDocument(page_content=doc.page_content, metadata=doc.metadata)
+            for doc in response["source_documents"]
+        ]
+
+        return QueryResponse(answer=response["result"], source_documents=source_docs)
     except Exception as e:
-        print(f"An error occurred during query processing: {e}")
+        print(f"Error processing query: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing query: {e}")
 
-# --- Run the FastAPI app ---
-if __name__ == "__main__":
-    # When running directly (e.g., for local testing without Docker Compose),
-    # this will also trigger the startup event.
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/")
+async def read_root():
+    return {"message": "LangChain RAG FastAPI is running! Use /query endpoint for RAG."}

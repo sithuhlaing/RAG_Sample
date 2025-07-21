@@ -20,23 +20,27 @@ services:
     restart: always
 
   langchain_app:
-    build: 
-      context: .
-      dockerfile: Dockerfile
-    container_name: langchain_rag_server
+    build:
+      context: . # Build context is the root of your project
+      dockerfile: Dockerfile # Specifies the Dockerfile to use
+    container_name: fast_api_ollama_rag_app # Changed name for clarity
     ports:
-      - "8000:8000" # Expose FastAPI's port to your host
-    volumes:
-      - ./data:/app/data # Mount your data directory for RAG
-      - chroma_db_data:/app/chroma_db # Persist ChromaDB data if used
+      - "8000:8000"
     environment:
-      # Pass the Ollama service URL to the FastAPI app
-      # 'ollama' is the service name, and 11434 is its default port
-      OLLAMA_HOST: http://ollama:11434
-      OLLAMA_MODEL_NAME: phi3:mini # Or your preferred LLM, e.g., llama2, gemma
-      EMBEDDING_MODEL_NAME: nomic-embed-text # Or a HuggingFace model like BAAI/bge-small-en-v1.5
+      # Pass your Hugging Face Token as an environment variable
+      HF_TOKEN: ${HF_TOKEN} # Docker Compose will read this from your .env file
+    volumes:
+      # Mount your local project directory into the container's /app directory
+      # This enables hot-reloading during development
+      - .:/app
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"] # --reload for development
     depends_on:
-      - ollama # Ensure Ollama starts before your FastAPI app
+      # FastAPI app depends on Ollama if you plan to use Ollama for other things
+      # or if you were using Ollama for LLM/Embeddings before.
+      # For this specific HF API RAG, it's not strictly dependent for functionality,
+      # but good to keep if Ollama is part of your broader stack.
+      ollama:
+        condition: service_started
     restart: always
 
 volumes:
